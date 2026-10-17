@@ -1,0 +1,118 @@
+#!/bin/zsh
+# browser-bridge — drive a real, logged-in Arc profile with Playwright MCP,
+# from another machine over SSH. The caller (e.g. an agent supervisor) runs
+# these over SSH; nothing here listens on the network.
+#
+#   browser-bridge profiles
+#       JSON: Arc's profiles, their spaces, and whether each is ready (the
+#       patched extension is loaded there and its token can be read). Never
+#       prints a token.
+#   browser-bridge mcp <profile> [<space id>|-] [--blocked-origins "a;b"]
+#       Playwright MCP on stdio, attached to that profile through the patched
+#       extension; connect pages and new tabs open in the space (default: the
+#       profile's first). Exits when stdin closes.
+#   browser-bridge new-tab <profile> <space id> <url, base64url>
+#       Open a URL as a new tab in a space of the profile (http(s) only).
+#   browser-bridge init-token <profile>
+#       One-time setup after loading the extension in a profile (a tab flashes up).
+#
+# A profile is Arc's directory name ("Default", "Profile 4"); a space is Arc's
+# space id (a UUID). Settings come from bridge.env next to this repo's README
+# (see bridge.env.example).
+emulate -L zsh
+setopt err_return
+B=${0:A:h:h}
+[[ -r $B/bridge.env ]] && source $B/bridge.env
+export BRIDGE_EXTENSION_DIR BRIDGE_TOKEN_CACHE
+node=${BRIDGE_NODE:-$(command -v node)}
+die() { print -u2 "browser-bridge: $1"; exit ${2:-64}; }
+valid_profile() { [[ $1 =~ '^(Default|Profile [0-9]{1,3})$' ]] || die "invalid Arc profile"; }
+valid_space() { [[ $1 =~ '^[0-9A-Fa-f-]{36}$' ]] || die "invalid space id"; }
+arc_running() { pgrep -x Arc >/dev/null || die "Arc isn't running on this Mac: open Arc first." 69; }
+
+cmd=$1; shift 2>/dev/null
+case $cmd in
+  profiles)
+    exec /usr/bin/python3 $B/lib/arc-profiles ;;
+
+  mcp)
+    profile=$1 space=${2:--}; shift 2 2>/dev/null || shift $#
+    valid_profile $profile
+    [[ $space == - ]] || valid_space $space
+    blocked=$BRIDGE_HIDDEN_ORIGINS
+    if [[ $1 == --blocked-origins ]]; then blocked="${blocked:+$blocked;}$2"; shift 2; fi
+    [[ -x $node ]] || die "no node (set BRIDGE_NODE in bridge.env)" 65
+    # The token lets the extension connect without asking in the browser; the
+    # caller's own approval is the gate.
+    token=$(/usr/bin/python3 $B/lib/arc-profiles --token $profile) || exit 65
+    # arc-open opens the connect page in a space of this profile, so the
+    # profile's own extension answers it.
+    if [[ $space == - ]]; then
+      space=$(/usr/bin/python3 $B/lib/arc-profiles --space $profile) || exit 65
+    else
+      /usr/bin/python3 $B/lib/arc-profiles --space $profile $space >/dev/null || exit 65
+    fi
+    export PLAYWRIGHT_MCP_EXTENSION_TOKEN=$token ARC_SPACE_ID=$space
+    mkdir -p $B/output
+    exec $node $B/node_modules/@playwright/mcp/cli.js --extension \
+      --output-dir $B/output \
+      ${blocked:+--blocked-origins} ${blocked:+$blocked} \
+      --executable-path $B/lib/arc-open "$@" ;;
+
+  new-tab)
+    profile=$1 space=$2 enc=$3
+    valid_profile $profile; valid_space $space
+    [[ $enc =~ '^[A-Za-z0-9_-]+=*$' ]] || die "invalid url encoding"
+    /usr/bin/python3 $B/lib/arc-profiles --space $profile $space >/dev/null || exit 65
+    url=$(/usr/bin/python3 -c 'import base64,sys; print(base64.urlsafe_b64decode(sys.argv[1] + "=" * (-len(sys.argv[1]) % 4)).decode())' $enc) || exit 64
+    [[ $url =~ '^https?://' || $url == about:blank ]] || die "only http(s) URLs"
+    for o in ${(s:;:)BRIDGE_HIDDEN_ORIGINS}; do [[ $url == $o || $url == $o/* ]] && die "that site is never opened through the bridge"; done
+    arc_running
+    /usr/bin/osascript - "$url" "$space" <<'OSA' >/dev/null
+on run argv
+  tell application "Arc"
+    if (count of windows) is 0 then make new window
+    tell front window
+      tell (first space whose id is (item 2 of argv)) to make new tab with properties {URL:(item 1 of argv)}
+    end tell
+  end tell
+end run
+OSA
+    ;;
+
+  init-token)
+    profile=$1
+    valid_profile $profile
+    if /usr/bin/python3 $B/lib/arc-profiles --token $profile >/dev/null 2>&1; then print "$profile: token already readable"; exit 0; fi
+    space=$(/usr/bin/python3 $B/lib/arc-profiles --space $profile) || exit 65
+    arc_running
+    # The connect page, with no token and a relay on a closed port: it creates
+    # the profile's token and connects to nothing.
+    marker="browser-bridge-token-setup"
+    url="chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/connect.html?mcpRelayUrl=ws%3A%2F%2F127.0.0.1%3A9%2Fextension%2F$marker&client=%7B%22name%22%3A%22token%20setup%22%7D&protocolVersion=2"
+    /usr/bin/osascript - "$url" "$space" <<'OSA' >/dev/null || exit 70
+on run argv
+  tell application "Arc"
+    if (count of windows) is 0 then make new window
+    tell front window
+      tell (first space whose id is (item 2 of argv)) to make new tab with properties {URL:(item 1 of argv)}
+    end tell
+  end tell
+end run
+OSA
+    ok=0
+    for i in {1..40}; do
+      sleep 0.5
+      if /usr/bin/python3 $B/lib/arc-profiles --token $profile >/dev/null 2>&1; then ok=1; break; fi
+    done
+    # Tabs are closed through the window: closing them through a space doesn't work.
+    /usr/bin/osascript - "$marker" <<'OSA' >/dev/null
+on run argv
+  tell application "Arc" to tell front window to close (every tab whose URL contains (item 1 of argv))
+end run
+OSA
+    (( ok )) && print "$profile: token ready" || die "$profile: no token after 20s (is the extension enabled in that profile?)" 1 ;;
+
+  *)
+    sed -n '2,21p' $0 | sed 's/^# \{0,1\}//' >&2; exit 64 ;;
+esac

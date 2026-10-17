@@ -1,0 +1,11 @@
+arc-playwright-bridge
+
+extension/ is a modified copy of the Playwright Extension (Chrome Web Store id
+mmlmfjhmonkocbjadbfplnigmagldckm), version 0.4.0, Copyright (c) Microsoft
+Corporation, licensed under the Apache License, Version 2.0. Changes, all in
+extension/lib/background.mjs and extension/manifest.json, are described in
+README.md ("The patched extension"): stubs for Arc's missing tab-group APIs,
+exposing every tab in the profile, hidden origins, and the manifest's name and
+update/signature metadata.
+
+The rest of this repository is licensed under the Apache License, Version 2.0.

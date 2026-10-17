@@ -1,0 +1,4 @@
+bridge.env
+node_modules/
+output/
+extension/hidden-origins.json

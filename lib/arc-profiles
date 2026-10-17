@@ -1,0 +1,153 @@
+#!/usr/bin/python3
+"""Arc profiles the bridge can drive (browser-bridge profiles).
+
+  arc-profiles                 JSON: every Arc profile with its spaces, whether the
+                               patched Playwright extension is loaded and whether
+                               its token can be read. Never prints a token.
+  arc-profiles --token <dir>   the extension token for a profile (launcher use only)
+  arc-profiles --space <dir> [<space id>]
+                               the space id arc-open opens connect pages in: the
+                               given one if it belongs to the profile, else the
+                               profile's first space in the sidebar
+
+A profile is named by its directory ("Default", "Profile 4"); people know it by
+its spaces. Tokens are read from the profile's Local Storage, so reloading the
+extension (which makes a new token) needs no follow-up. The last token read is
+cached in $BRIDGE_TOKEN_CACHE (~/.config/arc-playwright-bridge/tokens) for when LevelDB has compacted it
+into a form this can't scan.
+"""
+import glob, json, os, re, sys
+
+EXT_ID = "mmlmfjhmonkocbjadbfplnigmagldckm"
+# The patched extension's folder, as loaded unpacked in Arc (default: this
+# repo's extension/), and where the last readable token per profile is cached.
+HERE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+PATCHED = os.path.expanduser(os.environ.get("BRIDGE_EXTENSION_DIR") or os.path.join(HERE, "extension"))
+ARC = os.path.expanduser("~/Library/Application Support/Arc")
+USER_DATA = os.path.join(ARC, "User Data")
+CACHE = os.path.expanduser(os.environ.get("BRIDGE_TOKEN_CACHE") or "~/.config/arc-playwright-bridge/tokens")
+VALID = re.compile(r"^(Default|Profile [0-9]{1,3})$")
+TOKEN_RE = re.compile(rb"_chrome-extension://" + EXT_ID.encode() + rb"\x00\x01auth-token.{0,4}?([A-Za-z0-9_-]{43})(?![A-Za-z0-9_-])", re.S)
+
+
+def spaces():
+    """profile dir -> [(space id, title)] in sidebar order."""
+    out = {}
+    with open(os.path.join(ARC, "StorableSidebar.json")) as f:
+        sidebar = json.load(f)["sidebar"]
+    for cont in sidebar.get("containers", []):
+        if not isinstance(cont, dict):
+            continue
+        for s in cont.get("spaces", []):
+            if not isinstance(s, dict):
+                continue
+            prof = s.get("profile") or {}
+            if prof.get("default"):
+                d = "Default"
+            else:
+                d = ((prof.get("custom") or {}).get("_0") or {}).get("directoryBasename")
+            if d:
+                out.setdefault(d, []).append((s.get("id", ""), s.get("title") or "Untitled"))
+    return out
+
+
+def extension(d):
+    for name in ("Secure Preferences", "Preferences"):
+        try:
+            with open(os.path.join(USER_DATA, d, name)) as f:
+                e = json.load(f).get("extensions", {}).get("settings", {}).get(EXT_ID)
+        except (OSError, ValueError):
+            continue
+        if e:
+            if e.get("state") == 0 or e.get("disable_reasons"):
+                return "disabled"
+            if e.get("location") == 4 and os.path.realpath(e.get("path", "")) == os.path.realpath(PATCHED):
+                return "patched"
+            return "unpatched"
+    return "missing"
+
+
+def token(d):
+    found = None
+    files = glob.glob(os.path.join(USER_DATA, d, "Local Storage", "leveldb", "*.l[od][gb]"))
+    for path in sorted(files, key=os.path.getmtime):
+        try:
+            with open(path, "rb") as f:
+                for m in TOKEN_RE.finditer(f.read()):
+                    found = m.group(1).decode()
+        except OSError:
+            pass
+    cache = os.path.join(CACHE, d)
+    if found:
+        os.makedirs(CACHE, mode=0o700, exist_ok=True)
+        try:
+            with open(cache) as f:
+                same = f.read().strip() == found
+        except OSError:
+            same = False
+        if not same:
+            fd = os.open(cache + ".new", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(found)
+            os.replace(cache + ".new", cache)
+        return found
+    try:
+        with open(cache) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def space_for(d, sp):
+    """The profile's default space for new tabs: its first in Ben's sidebar."""
+    mine = sp.get(d, [])
+    return mine[0] if mine else (None, None)
+
+
+def main(argv):
+    sp = spaces()
+    if argv[1:2] == ["--space"] and len(argv) == 4:
+        d, want = argv[2], argv[3]
+        if not VALID.match(d):
+            sys.exit("arc-profiles: invalid profile")
+        if want not in [sid for sid, _ in sp.get(d, [])]:
+            sys.exit(f"arc-profiles: that space isn't in Arc profile {d}")
+        print(want)
+        return
+    if len(argv) == 3 and argv[1] in ("--token", "--space"):
+        d = argv[2]
+        if not VALID.match(d):
+            sys.exit("arc-profiles: invalid profile")
+        if argv[1] == "--token":
+            t = token(d)
+            if not t:
+                sys.exit(f"arc-profiles: no Playwright extension token in Arc profile {d}")
+            print(t)
+        else:
+            sid, _ = space_for(d, sp)
+            if not sid:
+                sys.exit(f"arc-profiles: Arc profile {d} has no spaces")
+            print(sid)
+        return
+    if len(argv) != 1:
+        sys.exit(__doc__)
+    profiles = []
+    for d in sorted(sp, key=lambda d: (d != "Default", int(d.split()[-1]) if d != "Default" else 0)):
+        ext = extension(d)
+        sid, stitle = space_for(d, sp)
+        has_token = bool(token(d)) if ext == "patched" else False
+        profiles.append({
+            "id": d,
+            "name": " · ".join(t for _, t in sp[d]),
+            "spaces": [t for _, t in sp[d]],
+            "spaceIds": [{"id": sid, "title": t} for sid, t in sp[d]],
+            "opensIn": stitle,
+            "extension": ext,
+            "token": has_token,
+            "ready": ext == "patched" and has_token,
+        })
+    json.dump({"profiles": profiles}, sys.stdout)
+    print()
+
+
+main(sys.argv)

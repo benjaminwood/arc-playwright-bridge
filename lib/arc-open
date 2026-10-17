@@ -1,0 +1,25 @@
+#!/bin/sh
+# Playwright "launches the browser" with its extension connect URL. Never start
+# Arc ourselves: a second instance is refused, and one started over SSH has no
+# Keychain access to the user's profiles. Hand the URL to the Arc that's
+# already open, as a new tab in the space ARC_SPACE_ID (a space of the chosen profile,
+# so that profile's extension answers), via AppleScript.
+url=""
+for a in "$@"; do case "$a" in chrome-extension://*) url="$a" ;; esac; done
+[ -n "$url" ] || { echo "arc-open: no connect URL in arguments" >&2; exit 64; }
+[ -n "$ARC_SPACE_ID" ] || { echo "arc-open: no ARC_SPACE_ID" >&2; exit 64; }
+pgrep -x Arc >/dev/null || { echo "Arc isn't running on the Mac — open Arc first." >&2; exit 69; }
+exec /usr/bin/osascript - "$url" "$ARC_SPACE_ID" <<'OSA'
+on run argv
+  set theURL to item 1 of argv
+  set spaceID to item 2 of argv
+  tell application "Arc"
+    if (count of windows) is 0 then make new window
+    tell front window
+      tell (first space whose id is spaceID)
+        make new tab with properties {URL:theURL}
+      end tell
+    end tell
+  end tell
+end run
+OSA
